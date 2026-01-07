@@ -1,0 +1,6 @@
+build/
+plugins/
+.cache/
+*.dylib
+*.so
+*.dll

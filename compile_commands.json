@@ -1,0 +1,7 @@
+[
+  {
+    "directory": "/Users/nealsanche/nosuch/rainbow",
+    "command": "clang++ -std=c++11 -I. -I./distingNT_API/include -c rainbow.cpp -o rainbow.o",
+    "file": "rainbow.cpp"
+  }
+]
