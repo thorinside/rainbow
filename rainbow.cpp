@@ -20,9 +20,11 @@
 // CONFIGURATION
 // ============================================================================
 
-// FIR kernel size (using wavetable mipmap level)
-// 64 taps is a good balance between quality and CPU usage
-static constexpr int kKernelSize = 64;
+// FIR kernel sizes (using wavetable mipmap levels)
+// Higher = more filter character but more CPU
+static constexpr int kMaxKernelSize = 512;
+static constexpr int kKernelSizes[] = { 64, 128, 256, 512 };
+static constexpr int kNumKernelSizes = 4;
 
 // Maximum channels supported
 static constexpr int kMaxChannels = 12;
@@ -59,6 +61,7 @@ enum {
 	kParamDepth,
 	kParamGain,
 	kParamSaturation,
+	kParamKernelSize,
 	
 	kNumSharedParams,
 };
@@ -72,6 +75,9 @@ enum {
 	kParamsPerChannel,
 };
 
+// Kernel size enum strings
+static const char* const kernelSizeStrings[] = { "64", "128", "256", "512", NULL };
+
 // Base parameters (shared)
 static const _NT_parameter sharedParameters[] = {
 	{ .name = "Wavetable", .min = 0, .max = 32767, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
@@ -79,6 +85,7 @@ static const _NT_parameter sharedParameters[] = {
 	{ .name = "Depth", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 	{ .name = "Gain", .min = -240, .max = 240, .def = 0, .unit = kNT_unitDb, .scaling = kNT_scaling10, .enumStrings = NULL },
 	{ .name = "Saturation", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "Resolution", .min = 0, .max = kNumKernelSizes - 1, .def = 2, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kernelSizeStrings },
 };
 
 // Per-channel parameter template
@@ -91,7 +98,7 @@ static const _NT_parameter channelParameterTemplate[] = {
 // PARAMETER PAGES
 // ============================================================================
 
-static const uint8_t pageMain[] = { kParamWavetable, kParamIndex, kParamDepth };
+static const uint8_t pageMain[] = { kParamWavetable, kParamIndex, kParamDepth, kParamKernelSize };
 static const uint8_t pageOutput[] = { kParamGain, kParamSaturation };
 
 static const _NT_parameterPage sharedPages[] = {
@@ -105,7 +112,7 @@ static const _NT_parameterPage sharedPages[] = {
 
 // Per-channel state (in DTC for fast access)
 struct ChannelState {
-	float delayLine[kKernelSize];
+	float delayLine[kMaxKernelSize];
 	int writePos;
 };
 
@@ -113,13 +120,18 @@ struct ChannelState {
 struct _rainbow_DTC {
 	ChannelState channels[kMaxChannels];
 	
-	// Current kernel (interpolated from wavetable)
-	float kernel[kKernelSize];
+	// Current and pending kernels for crossfade
+	float kernel[kMaxKernelSize];
+	float newKernel[kMaxKernelSize];
+	float crossfadeMix;
+	bool crossfading;
 	
 	// Cached parameter values
 	float depth;
 	float gain;
 	float saturation;
+	int kernelSize;
+	int kernelMask;
 };
 
 // Main algorithm structure
@@ -166,20 +178,11 @@ static inline float softSaturate(float x, float amount) {
 	return tanh(x * drive) / tanh(drive);
 }
 
-// Update kernel from wavetable based on index
-static void updateKernel(_rainbowAlgorithm* pThis) {
-	if (!pThis->wavetableLoaded || pThis->request.error)
-		return;
-	
-	if (!pThis->request.usingMipMaps || pThis->request.numWaves == 0)
-		return;
-	
+static void buildKernel(_rainbowAlgorithm* pThis, float* dest) {
 	_rainbow_DTC* dtc = pThis->dtc;
 	
-	// Get index parameter (0-100%)
 	float indexParam = pThis->v[kParamWavetable + kParamIndex] * 0.001f;
 	
-	// Map to wave position
 	float offset = indexParam * (pThis->request.numWaves - 1);
 	offset = std::max(0.0f, std::min(offset, (float)(pThis->request.numWaves - 1) - 0.0001f));
 	
@@ -187,29 +190,48 @@ static void updateKernel(_rainbowAlgorithm* pThis) {
 	int wave1 = std::min(wave0 + 1, (int)pThis->request.numWaves - 1);
 	float frac = offset - wave0;
 	
-	// Access 64x64 mipmap level
-	// Mipmap offset for size s is: s * numWaves
-	const int16_t* mip0 = pThis->wavetableBuffer + kKernelSize * (pThis->request.numWaves + wave0);
-	const int16_t* mip1 = pThis->wavetableBuffer + kKernelSize * (pThis->request.numWaves + wave1);
+	const int kernelSize = dtc->kernelSize;
 	
-	// Interpolate and normalize to float kernel
+	const int16_t* mip0 = pThis->wavetableBuffer + kernelSize * (pThis->request.numWaves + wave0);
+	const int16_t* mip1 = pThis->wavetableBuffer + kernelSize * (pThis->request.numWaves + wave1);
+	
 	float sum = 0.0f;
-	for (int i = 0; i < kKernelSize; ++i) {
+	for (int i = 0; i < kernelSize; ++i) {
 		float v0 = mip0[i] / 32768.0f;
 		float v1 = mip1[i] / 32768.0f;
-		dtc->kernel[i] = v0 + frac * (v1 - v0);
-		sum += fabsf(dtc->kernel[i]);
+		dest[i] = v0 + frac * (v1 - v0);
+		sum += fabsf(dest[i]);
 	}
 	
-	// Normalize kernel to prevent gain changes
 	if (sum > 0.001f) {
 		float scale = 1.0f / sum;
-		for (int i = 0; i < kKernelSize; ++i) {
-			dtc->kernel[i] *= scale;
+		for (int i = 0; i < kernelSize; ++i) {
+			dest[i] *= scale;
 		}
 	}
 	
 	pThis->currentIndexParam = indexParam;
+}
+
+static void updateKernel(_rainbowAlgorithm* pThis) {
+	if (!pThis->wavetableLoaded || pThis->request.error)
+		return;
+	if (!pThis->request.usingMipMaps || pThis->request.numWaves == 0)
+		return;
+	
+	buildKernel(pThis, pThis->dtc->kernel);
+}
+
+static void updateKernelWithCrossfade(_rainbowAlgorithm* pThis) {
+	if (pThis->request.error)
+		return;
+	if (!pThis->request.usingMipMaps || pThis->request.numWaves == 0)
+		return;
+	
+	_rainbow_DTC* dtc = pThis->dtc;
+	buildKernel(pThis, dtc->newKernel);
+	dtc->crossfadeMix = 0.0f;
+	dtc->crossfading = true;
 }
 
 // ============================================================================
@@ -238,10 +260,14 @@ static void calculateRequirements(_NT_algorithmRequirements& req, const int32_t*
 static void wavetableCallback(void* callbackData) {
 	_rainbowAlgorithm* pThis = (_rainbowAlgorithm*)callbackData;
 	pThis->awaitingCallback = false;
-	pThis->wavetableLoaded = !pThis->request.error;
 	
-	if (pThis->wavetableLoaded) {
-		updateKernel(pThis);
+	if (!pThis->request.error) {
+		if (pThis->wavetableLoaded) {
+			updateKernelWithCrossfade(pThis);
+		} else {
+			pThis->wavetableLoaded = true;
+			buildKernel(pThis, pThis->dtc->kernel);
+		}
 	}
 }
 
@@ -336,6 +362,8 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
 	alg->dtc->depth = 0.5f;
 	alg->dtc->gain = 1.0f;
 	alg->dtc->saturation = 0.0f;
+	alg->dtc->kernelSize = kKernelSizes[2];  // Default: 256
+	alg->dtc->kernelMask = alg->dtc->kernelSize - 1;
 	
 	return alg;
 }
@@ -361,7 +389,6 @@ static void parameterChanged(_NT_algorithm* self, int p) {
 			pThis->request.index = pThis->v[kParamWavetable];
 			if (NT_readWavetable(pThis->request)) {
 				pThis->awaitingCallback = true;
-				pThis->wavetableLoaded = false;
 			}
 		}
 		break;
@@ -383,6 +410,15 @@ static void parameterChanged(_NT_algorithm* self, int p) {
 		
 	case kParamSaturation:
 		dtc->saturation = pThis->v[kParamSaturation] / 100.0f;
+		break;
+		
+	case kParamKernelSize:
+		{
+			int idx = std::max(0, std::min((int)pThis->v[kParamKernelSize], kNumKernelSizes - 1));
+			dtc->kernelSize = kKernelSizes[idx];
+			dtc->kernelMask = dtc->kernelSize - 1;
+			updateKernel(pThis);
+		}
 		break;
 	}
 }
@@ -407,9 +443,15 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 	const float gain = dtc->gain;
 	const float saturation = dtc->saturation;
 	const float* __restrict kernel = dtc->kernel;
+	const float* __restrict newKernel = dtc->newKernel;
 	const bool doConvolve = pThis->wavetableLoaded;
 	const bool doSaturate = saturation > 0.001f;
-	constexpr int kMask = kKernelSize - 1;
+	const int kernelSize = dtc->kernelSize;
+	const int kernelMask = dtc->kernelMask;
+	
+	bool crossfading = dtc->crossfading;
+	float crossfadeMix = dtc->crossfadeMix;
+	constexpr float kCrossfadeRate = 1.0f / 2400.0f;  // ~50ms at 48kHz
 	
 	for (int ch = 0; ch < pThis->numChannels; ++ch) {
 		const int baseParam = kNumSharedParams + ch * kParamsPerChannel;
@@ -420,29 +462,41 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 		float* __restrict delay = state->delayLine;
 		int wp = state->writePos;
 		
+		float localMix = crossfadeMix;
+		
 		for (int i = 0; i < numFrames; ++i) {
 			const float dry = in[i];
 			delay[wp] = dry;
 			
 			float wet;
 			if (doConvolve) {
-				wet = 0.0f;
+				float wetOld = 0.0f;
+				float wetNew = 0.0f;
 				int rp = wp;
-				for (int k = 0; k < kKernelSize; k += 4) {
-					wet += delay[rp] * kernel[k];
-					rp = (rp - 1) & kMask;
-					wet += delay[rp] * kernel[k + 1];
-					rp = (rp - 1) & kMask;
-					wet += delay[rp] * kernel[k + 2];
-					rp = (rp - 1) & kMask;
-					wet += delay[rp] * kernel[k + 3];
-					rp = (rp - 1) & kMask;
+				for (int k = 0; k < kernelSize; k += 4) {
+					wetOld += delay[rp] * kernel[k];
+					wetNew += delay[rp] * newKernel[k];
+					rp = (rp - 1) & kernelMask;
+					wetOld += delay[rp] * kernel[k + 1];
+					wetNew += delay[rp] * newKernel[k + 1];
+					rp = (rp - 1) & kernelMask;
+					wetOld += delay[rp] * kernel[k + 2];
+					wetNew += delay[rp] * newKernel[k + 2];
+					rp = (rp - 1) & kernelMask;
+					wetOld += delay[rp] * kernel[k + 3];
+					wetNew += delay[rp] * newKernel[k + 3];
+					rp = (rp - 1) & kernelMask;
+				}
+				wet = crossfading ? (wetOld * (1.0f - localMix) + wetNew * localMix) : wetOld;
+				
+				if (crossfading && ch == 0) {
+					localMix += kCrossfadeRate;
 				}
 			} else {
 				wet = dry;
 			}
 			
-			wp = (wp + 1) & kMask;
+			wp = (wp + 1) & kernelMask;
 			
 			float mixed = dry * dryMix + wet * depth;
 			if (doSaturate) mixed = softSaturate(mixed, saturation);
@@ -452,6 +506,22 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 			else out[i] += mixed;
 		}
 		state->writePos = wp;
+		
+		if (ch == 0 && crossfading) {
+			crossfadeMix = localMix;
+		}
+	}
+	
+	if (crossfading) {
+		if (crossfadeMix >= 1.0f) {
+			for (int i = 0; i < kernelSize; ++i) {
+				dtc->kernel[i] = dtc->newKernel[i];
+			}
+			dtc->crossfading = false;
+			dtc->crossfadeMix = 0.0f;
+		} else {
+			dtc->crossfadeMix = crossfadeMix;
+		}
 	}
 }
 
@@ -486,13 +556,12 @@ static bool draw(_NT_algorithm* self) {
 		int wave = (int)offset;
 		float frac = offset - wave;
 		
-		// Access 64x64 mipmap
-		const int16_t* mip0 = pThis->wavetableBuffer + kKernelSize * (pThis->request.numWaves + wave);
-		const int16_t* mip1 = pThis->wavetableBuffer + kKernelSize * (pThis->request.numWaves + std::min(wave + 1, (int)pThis->request.numWaves - 1));
+		constexpr int kDisplaySize = 64;
+		const int16_t* mip0 = pThis->wavetableBuffer + kDisplaySize * (pThis->request.numWaves + wave);
+		const int16_t* mip1 = pThis->wavetableBuffer + kDisplaySize * (pThis->request.numWaves + std::min(wave + 1, (int)pThis->request.numWaves - 1));
 		
-		// Draw waveform
 		float prevX = 0, prevY = 0;
-		for (int i = 0; i < kKernelSize; ++i) {
+		for (int i = 0; i < kDisplaySize; ++i) {
 			float v0 = mip0[i];
 			float v1 = mip1[i];
 			float v = v0 + frac * (v1 - v0);
