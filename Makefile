@@ -81,6 +81,9 @@ endif
 hardware:
 	@$(MAKE) TARGET=hardware
 
+push: hardware
+	ntpush $(OUTPUT_DIR)/$(PLUGIN_NAME).o
+
 test:
 	@$(MAKE) TARGET=test
 
@@ -98,4 +101,4 @@ clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)
 	@echo "Cleaned build and output directories"
 
-.PHONY: all hardware test both check size clean
+.PHONY: all hardware test both push check size clean
