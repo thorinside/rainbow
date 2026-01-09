@@ -58,6 +58,7 @@ static const _NT_specification specifications[] = {
 enum {
 	kParamWavetable,
 	kParamIndex,
+	kParamSpread,
 	kParamDepth,
 	kParamGain,
 	kParamSaturation,
@@ -82,6 +83,7 @@ static const char* const kernelSizeStrings[] = { "64", "128", "256", "512", NULL
 static const _NT_parameter sharedParameters[] = {
 	{ .name = "Wavetable", .min = 0, .max = 32767, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
 	{ .name = "Index", .min = 0, .max = 1000, .def = 500, .unit = kNT_unitPercent, .scaling = kNT_scaling10, .enumStrings = NULL },
+	{ .name = "Spread", .min = 0, .max = 1000, .def = 0, .unit = kNT_unitPercent, .scaling = kNT_scaling10, .enumStrings = NULL },
 	{ .name = "Depth", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 	{ .name = "Gain", .min = -240, .max = 240, .def = 0, .unit = kNT_unitDb, .scaling = kNT_scaling10, .enumStrings = NULL },
 	{ .name = "Saturation", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
@@ -98,11 +100,11 @@ static const _NT_parameter channelParameterTemplate[] = {
 // PARAMETER PAGES
 // ============================================================================
 
-static const uint8_t pageMain[] = { kParamWavetable, kParamIndex, kParamDepth, kParamKernelSize };
+static const uint8_t pageMain[] = { kParamWavetable, kParamIndex, kParamSpread, kParamDepth, kParamKernelSize };
 static const uint8_t pageOutput[] = { kParamGain, kParamSaturation };
 
 static const _NT_parameterPage sharedPages[] = {
-	{ .name = "Wavetable", .numParams = ARRAY_SIZE(pageMain), .params = pageMain },
+	{ .name = "Colour", .numParams = ARRAY_SIZE(pageMain), .params = pageMain },
 	{ .name = "Output", .numParams = ARRAY_SIZE(pageOutput), .params = pageOutput },
 };
 
@@ -111,8 +113,9 @@ static const _NT_parameterPage sharedPages[] = {
 // ============================================================================
 
 // Per-channel state (in DTC for fast access)
+// Delay line is 2x size for contiguous convolution reads (no per-tap masking)
 struct ChannelState {
-	float delayLine[kMaxKernelSize];
+	float delayLine[kMaxKernelSize * 2];
 	int writePos;
 };
 
@@ -120,9 +123,9 @@ struct ChannelState {
 struct _rainbow_DTC {
 	ChannelState channels[kMaxChannels];
 	
-	// Current and pending kernels for crossfade
-	float kernel[kMaxKernelSize];
-	float newKernel[kMaxKernelSize];
+	// Per-channel kernels for spread effect, with crossfade support
+	float kernels[kMaxChannels][kMaxKernelSize];
+	float newKernels[kMaxChannels][kMaxKernelSize];
 	float crossfadeMix;
 	bool crossfading;
 	
@@ -130,6 +133,7 @@ struct _rainbow_DTC {
 	float depth;
 	float gain;
 	float saturation;
+	float spread;
 	int kernelSize;
 	int kernelMask;
 };
@@ -147,6 +151,7 @@ struct _rainbowAlgorithm : public _NT_algorithm {
 	_NT_parameterPage* pages;
 	int numPages;
 	uint8_t* pageArrays;
+	char* paramNames;
 	_NT_parameterPages paramPages;
 	
 	// Memory pointers
@@ -178,11 +183,10 @@ static inline float softSaturate(float x, float amount) {
 	return tanh(x * drive) / tanh(drive);
 }
 
-static void buildKernel(_rainbowAlgorithm* pThis, float* dest) {
+static void buildKernelAtIndex(_rainbowAlgorithm* pThis, float* dest, float indexParam) {
 	_rainbow_DTC* dtc = pThis->dtc;
 	
-	float indexParam = pThis->v[kParamWavetable + kParamIndex] * 0.001f;
-	
+	indexParam = std::max(0.0f, std::min(1.0f, indexParam));
 	float offset = indexParam * (pThis->request.numWaves - 1);
 	offset = std::max(0.0f, std::min(offset, (float)(pThis->request.numWaves - 1) - 0.0001f));
 	
@@ -209,6 +213,25 @@ static void buildKernel(_rainbowAlgorithm* pThis, float* dest) {
 			dest[i] *= scale;
 		}
 	}
+}
+
+static void buildAllKernels(_rainbowAlgorithm* pThis, float kernels[][kMaxKernelSize]) {
+	float indexParam = pThis->v[kParamIndex] * 0.001f;
+	float spread = pThis->v[kParamSpread] * 0.001f;
+	int numChannels = pThis->numChannels;
+	int kernelSize = pThis->dtc->kernelSize;
+	
+	if (spread < 0.001f || numChannels == 1) {
+		buildKernelAtIndex(pThis, kernels[0], indexParam);
+		for (int ch = 1; ch < numChannels; ++ch) {
+			memcpy(kernels[ch], kernels[0], kernelSize * sizeof(float));
+		}
+	} else {
+		for (int ch = 0; ch < numChannels; ++ch) {
+			float chOffset = spread * ((float)ch / (numChannels - 1) - 0.5f);
+			buildKernelAtIndex(pThis, kernels[ch], indexParam + chOffset);
+		}
+	}
 	
 	pThis->currentIndexParam = indexParam;
 }
@@ -219,7 +242,7 @@ static void updateKernel(_rainbowAlgorithm* pThis) {
 	if (!pThis->request.usingMipMaps || pThis->request.numWaves == 0)
 		return;
 	
-	buildKernel(pThis, pThis->dtc->kernel);
+	buildAllKernels(pThis, pThis->dtc->kernels);
 }
 
 static void updateKernelWithCrossfade(_rainbowAlgorithm* pThis) {
@@ -229,7 +252,7 @@ static void updateKernelWithCrossfade(_rainbowAlgorithm* pThis) {
 		return;
 	
 	_rainbow_DTC* dtc = pThis->dtc;
-	buildKernel(pThis, dtc->newKernel);
+	buildAllKernels(pThis, dtc->newKernels);
 	dtc->crossfadeMix = 0.0f;
 	dtc->crossfading = true;
 }
@@ -245,13 +268,14 @@ static void calculateRequirements(_NT_algorithmRequirements& req, const int32_t*
 	// Parameter storage
 	size_t paramSize = numParams * sizeof(_NT_parameter);
 	
-	// Page arrays (2 shared pages + 1 routing page per channel)
-	int numPages = 2 + numChannels;
+	// 3 pages: Wavetable, Output, Routing
+	int numPages = 3;
 	size_t pageSize = numPages * sizeof(_NT_parameterPage);
 	size_t pageArraySize = numChannels * kParamsPerChannel * sizeof(uint8_t);
+	size_t paramNameSize = numChannels * kParamsPerChannel * 16;  // "Output 12 Mode\0" etc
 	
 	req.numParameters = numParams;
-	req.sram = sizeof(_rainbowAlgorithm) + paramSize + pageSize + pageArraySize;
+	req.sram = sizeof(_rainbowAlgorithm) + paramSize + pageSize + pageArraySize + paramNameSize;
 	req.dram = kWavetableBufferSize * sizeof(int16_t);
 	req.dtc = sizeof(_rainbow_DTC);
 	req.itc = 0;
@@ -266,7 +290,7 @@ static void wavetableCallback(void* callbackData) {
 			updateKernelWithCrossfade(pThis);
 		} else {
 			pThis->wavetableLoaded = true;
-			buildKernel(pThis, pThis->dtc->kernel);
+			buildAllKernels(pThis, pThis->dtc->kernels);
 		}
 	}
 }
@@ -276,7 +300,7 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
                                 const int32_t* specifications) {
 	int numChannels = specifications ? specifications[kSpecChannels] : 2;
 	int numParams = kNumSharedParams + numChannels * kParamsPerChannel;
-	int numPages = 2 + numChannels;
+	int numPages = 3;
 	
 	// Place algorithm struct
 	_rainbowAlgorithm* alg = new (ptrs.sram) _rainbowAlgorithm();
@@ -292,13 +316,18 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
 	mem += numPages * sizeof(_NT_parameterPage);
 	alg->numPages = numPages;
 	
-	// Allocate page arrays for channel routing
+	// Allocate page array for routing page
 	alg->pageArrays = mem;
+	mem += numChannels * kParamsPerChannel * sizeof(uint8_t);
+	
+	// Allocate parameter name strings
+	alg->paramNames = (char*)mem;
+	mem += numChannels * kParamsPerChannel * 16;
 	
 	// Copy shared parameters
 	memcpy(alg->params, sharedParameters, sizeof(sharedParameters));
 	
-	// Generate per-channel parameters
+	// Generate per-channel parameters with numbered names
 	for (int ch = 0; ch < numChannels; ++ch) {
 		int baseParam = kNumSharedParams + ch * kParamsPerChannel;
 		
@@ -306,28 +335,46 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
 		memcpy(&alg->params[baseParam], channelParameterTemplate, sizeof(channelParameterTemplate));
 		
 		// Adjust default bus assignments
-		alg->params[baseParam + kParamInput].def = 1 + ch;  // Input 1, 2, 3...
-		alg->params[baseParam + kParamOutput].def = 13 + ch;  // Output 13, 14, 15...
+		alg->params[baseParam + kParamInput].def = 1 + ch;
+		alg->params[baseParam + kParamOutput].def = 13 + ch;
+		
+		// Build parameter names: "Input 1", "Output 1", "Out 1 Mode"
+		for (int p = 0; p < kParamsPerChannel; ++p) {
+			char* name = alg->paramNames + (ch * kParamsPerChannel + p) * 16;
+			int len = 0;
+			
+			if (p == kParamInput) {
+				const char* s = "Input ";
+				while (*s) name[len++] = *s++;
+			} else if (p == kParamOutput) {
+				const char* s = "Output ";
+				while (*s) name[len++] = *s++;
+			} else {
+				const char* s = "Out ";
+				while (*s) name[len++] = *s++;
+			}
+			len += NT_intToString(name + len, 1 + ch);
+			if (p == kParamOutputMode) {
+				const char* s = " Mode";
+				while (*s) name[len++] = *s++;
+			}
+			name[len] = 0;
+			
+			alg->params[baseParam + p].name = name;
+		}
 	}
 	
 	// Build parameter pages
-	// First two pages are shared
 	alg->pages[0] = sharedPages[0];
 	alg->pages[1] = sharedPages[1];
 	
-	// Per-channel routing pages
-	for (int ch = 0; ch < numChannels; ++ch) {
-		uint8_t* pageArray = alg->pageArrays + ch * kParamsPerChannel;
-		int baseParam = kNumSharedParams + ch * kParamsPerChannel;
-		
-		for (int p = 0; p < kParamsPerChannel; ++p) {
-			pageArray[p] = baseParam + p;
-		}
-		
-		alg->pages[2 + ch].name = "Routing";
-		alg->pages[2 + ch].numParams = kParamsPerChannel;
-		alg->pages[2 + ch].params = pageArray;
+	// Single routing page with all channel parameters
+	for (int i = 0; i < numChannels * kParamsPerChannel; ++i) {
+		alg->pageArrays[i] = kNumSharedParams + i;
 	}
+	alg->pages[2].name = "Routing";
+	alg->pages[2].numParams = numChannels * kParamsPerChannel;
+	alg->pages[2].params = alg->pageArrays;
 	
 	// Set up parameter pages struct
 	alg->paramPages.numPages = numPages;
@@ -368,14 +415,7 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
 	return alg;
 }
 
-static int parameterUiPrefix(_NT_algorithm*, int p, char* buff) {
-	if (p >= kNumSharedParams) {
-		int ch = (p - kNumSharedParams) / kParamsPerChannel;
-		int len = NT_intToString(buff, 1 + ch);
-		buff[len++] = ':';
-		buff[len] = 0;
-		return len;
-	}
+static int parameterUiPrefix(_NT_algorithm*, int, char*) {
 	return 0;
 }
 
@@ -394,6 +434,7 @@ static void parameterChanged(_NT_algorithm* self, int p) {
 		break;
 		
 	case kParamIndex:
+	case kParamSpread:
 		updateKernel(pThis);
 		break;
 		
@@ -442,8 +483,6 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 	const float dryMix = 1.0f - depth;
 	const float gain = dtc->gain;
 	const float saturation = dtc->saturation;
-	const float* __restrict kernel = dtc->kernel;
-	const float* __restrict newKernel = dtc->newKernel;
 	const bool doConvolve = pThis->wavetableLoaded;
 	const bool doSaturate = saturation > 0.001f;
 	const int kernelSize = dtc->kernelSize;
@@ -462,35 +501,46 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 		float* __restrict delay = state->delayLine;
 		int wp = state->writePos;
 		
+		const float* __restrict kernel = dtc->kernels[ch];
+		const float* __restrict newKernel = dtc->newKernels[ch];
 		float localMix = crossfadeMix;
 		
 		for (int i = 0; i < numFrames; ++i) {
 			const float dry = in[i];
 			delay[wp] = dry;
+			delay[wp + kernelSize] = dry;
 			
 			float wet;
 			if (doConvolve) {
-				float wetOld = 0.0f;
-				float wetNew = 0.0f;
-				int rp = wp;
-				for (int k = 0; k < kernelSize; k += 4) {
-					wetOld += delay[rp] * kernel[k];
-					wetNew += delay[rp] * newKernel[k];
-					rp = (rp - 1) & kernelMask;
-					wetOld += delay[rp] * kernel[k + 1];
-					wetNew += delay[rp] * newKernel[k + 1];
-					rp = (rp - 1) & kernelMask;
-					wetOld += delay[rp] * kernel[k + 2];
-					wetNew += delay[rp] * newKernel[k + 2];
-					rp = (rp - 1) & kernelMask;
-					wetOld += delay[rp] * kernel[k + 3];
-					wetNew += delay[rp] * newKernel[k + 3];
-					rp = (rp - 1) & kernelMask;
-				}
-				wet = crossfading ? (wetOld * (1.0f - localMix) + wetNew * localMix) : wetOld;
+				const float* __restrict x = &delay[wp + kernelSize];
+				const float* __restrict h = kernel;
+				float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 				
-				if (crossfading && ch == 0) {
-					localMix += kCrossfadeRate;
+				for (int k = 0; k < kernelSize; k += 4) {
+					a0 = fmaf(x[0], h[k], a0);
+					a1 = fmaf(x[-1], h[k + 1], a1);
+					a2 = fmaf(x[-2], h[k + 2], a2);
+					a3 = fmaf(x[-3], h[k + 3], a3);
+					x -= 4;
+				}
+				float wetOld = (a0 + a1) + (a2 + a3);
+				
+				if (crossfading) {
+					x = &delay[wp + kernelSize];
+					h = newKernel;
+					a0 = 0.0f; a1 = 0.0f; a2 = 0.0f; a3 = 0.0f;
+					for (int k = 0; k < kernelSize; k += 4) {
+						a0 = fmaf(x[0], h[k], a0);
+						a1 = fmaf(x[-1], h[k + 1], a1);
+						a2 = fmaf(x[-2], h[k + 2], a2);
+						a3 = fmaf(x[-3], h[k + 3], a3);
+						x -= 4;
+					}
+					float wetNew = (a0 + a1) + (a2 + a3);
+					wet = wetOld + (wetNew - wetOld) * localMix;
+					if (ch == 0) localMix += kCrossfadeRate;
+				} else {
+					wet = wetOld;
 				}
 			} else {
 				wet = dry;
@@ -498,7 +548,7 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 			
 			wp = (wp + 1) & kernelMask;
 			
-			float mixed = dry * dryMix + wet * depth;
+			float mixed = fmaf(dry, dryMix, wet * depth);
 			if (doSaturate) mixed = softSaturate(mixed, saturation);
 			mixed *= gain;
 			
@@ -514,8 +564,10 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 	
 	if (crossfading) {
 		if (crossfadeMix >= 1.0f) {
-			for (int i = 0; i < kernelSize; ++i) {
-				dtc->kernel[i] = dtc->newKernel[i];
+			for (int ch = 0; ch < pThis->numChannels; ++ch) {
+				for (int i = 0; i < kernelSize; ++i) {
+					dtc->kernels[ch][i] = dtc->newKernels[ch][i];
+				}
 			}
 			dtc->crossfading = false;
 			dtc->crossfadeMix = 0.0f;
