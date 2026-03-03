@@ -81,7 +81,7 @@ static const char* const kernelSizeStrings[] = { "64", "128", "256", "512", NULL
 
 // Base parameters (shared)
 static const _NT_parameter sharedParameters[] = {
-	{ .name = "Wavetable", .min = 0, .max = 32767, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "Wavetable", .min = 0, .max = 32767, .def = 0, .unit = kNT_unitHasStrings, .scaling = 0, .enumStrings = NULL },
 	{ .name = "Index", .min = 0, .max = 1000, .def = 500, .unit = kNT_unitPercent, .scaling = kNT_scaling10, .enumStrings = NULL },
 	{ .name = "Spread", .min = 0, .max = 1000, .def = 0, .unit = kNT_unitPercent, .scaling = kNT_scaling10, .enumStrings = NULL },
 	{ .name = "Depth", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
@@ -104,8 +104,8 @@ static const uint8_t pageMain[] = { kParamWavetable, kParamIndex, kParamSpread, 
 static const uint8_t pageOutput[] = { kParamGain, kParamSaturation };
 
 static const _NT_parameterPage sharedPages[] = {
-	{ .name = "Colour", .numParams = ARRAY_SIZE(pageMain), .params = pageMain },
-	{ .name = "Output", .numParams = ARRAY_SIZE(pageOutput), .params = pageOutput },
+	{ .name = "Colour", .numParams = ARRAY_SIZE(pageMain), .group = 0, .unused = {}, .params = pageMain },
+	{ .name = "Output", .numParams = ARRAY_SIZE(pageOutput), .group = 0, .unused = {}, .params = pageOutput },
 };
 
 // ============================================================================
@@ -419,6 +419,19 @@ static int parameterUiPrefix(_NT_algorithm*, int, char*) {
 	return 0;
 }
 
+static int parameterString(_NT_algorithm* self, int p, int v, char* buff) {
+	if (p == kParamWavetable) {
+		_NT_wavetableInfo info;
+		NT_getWavetableInfo(v, info);
+		if (info.name) {
+			strncpy(buff, info.name, kNT_parameterStringSize - 1);
+			buff[kNT_parameterStringSize - 1] = 0;
+			return strlen(buff);
+		}
+	}
+	return 0;
+}
+
 static void parameterChanged(_NT_algorithm* self, int p) {
 	_rainbowAlgorithm* pThis = (_rainbowAlgorithm*)self;
 	_rainbow_DTC* dtc = pThis->dtc;
@@ -670,6 +683,7 @@ static const _NT_factory factory = {
 	.deserialise = NULL,
 	.midiSysEx = NULL,
 	.parameterUiPrefix = parameterUiPrefix,
+	.parameterString = parameterString,
 };
 
 // ============================================================================
@@ -679,7 +693,7 @@ static const _NT_factory factory = {
 uintptr_t pluginEntry(_NT_selector selector, uint32_t data) {
 	switch (selector) {
 	case kNT_selector_version:
-		return kNT_apiVersion10;  // Using v10 for parameterUiPrefix
+		return kNT_apiVersion12;  // Using v12 for parameterString
 		
 	case kNT_selector_numFactories:
 		return 1;
